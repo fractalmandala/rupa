@@ -34,14 +34,66 @@ struct Face: Identifiable, Hashable {
     let italic: Bool
 }
 
+enum Category: Int, CaseIterable, Identifiable {
+    case serif, sans, mono, other
+    var id: Int { rawValue }
+    var name: String { ["Serif", "Sans", "Mono", "Other"][rawValue] }
+
+    /// Monospace if "i" and "m" advance equally. Otherwise the font's own class (OS/2), then its
+    /// name, then the glyphs: serif when both "I" and "l" are wider at the foot than mid-stem.
+    /// Script, ornamental and fonts without Latin letters are "other".
+    static func classify(family: String, ps: String) -> Category {
+        let font = CTFontCreateWithName(ps as CFString, 200, nil)
+        func glyph(_ c: String) -> CGGlyph? {
+            var u = Array(c.utf16), g = [CGGlyph](repeating: 0, count: u.count)
+            return CTFontGetGlyphsForCharacters(font, &u, &g, u.count) && g[0] != 0 ? g[0] : nil
+        }
+        guard let gi = glyph("i"), let gm = glyph("m"), let gI = glyph("I"), let gl = glyph("l") else { return .other }
+        var adv = [CGSize](repeating: .zero, count: 2)
+        CTFontGetAdvancesForGlyphs(font, .horizontal, [gi, gm], &adv, 2)
+        if abs(adv[0].width - adv[1].width) < 0.5 { return .mono }
+
+        switch CTFontGetSymbolicTraits(font).rawValue & CTFontSymbolicTraits.traitClassMask.rawValue {
+        case CTFontStylisticClass.sansSerifClass.rawValue: return .sans
+        case CTFontStylisticClass.oldStyleSerifsClass.rawValue, CTFontStylisticClass.transitionalSerifsClass.rawValue,
+             CTFontStylisticClass.modernSerifsClass.rawValue, CTFontStylisticClass.clarendonSerifsClass.rawValue,
+             CTFontStylisticClass.slabSerifsClass.rawValue, CTFontStylisticClass.freeformSerifsClass.rawValue:
+            return .serif
+        case CTFontStylisticClass.scriptsClass.rawValue, CTFontStylisticClass.ornamentalsClass.rawValue,
+             CTFontStylisticClass.symbolicClass.rawValue:
+            return .other
+        default: break
+        }
+
+        let lower = family.lowercased()
+        if ["sans", "grotesk", "grotesque", "gothic", "hyperlegible"].contains(where: lower.contains) { return .sans }
+        if lower.contains("serif") || lower.contains("slab") { return .serif }
+
+        return footRatio(font, gI) > 1.35 && footRatio(font, gl) > 1.35 ? .serif : .sans
+    }
+
+    /// Ink width just above the baseline divided by ink width at mid-height.
+    static func footRatio(_ font: CTFont, _ g: CGGlyph) -> Double {
+        guard let path = CTFontCreatePathForGlyph(font, g, nil) else { return 1 }
+        let b = path.boundingBoxOfPath
+        func width(at y: CGFloat) -> Int {
+            (0..<200).filter { path.contains(CGPoint(x: b.minX + b.width * CGFloat($0) / 199, y: y)) }.count
+        }
+        let mid = width(at: b.midY)
+        return mid > 0 ? Double(width(at: b.minY + b.height * 0.03)) / Double(mid) : 1
+    }
+}
+
 final class Family: Identifiable {
     let id: String      // family name
     let faces: [Face]   // Thin → Black, upright before italic
     let primary: Face
+    let category: Category
     lazy var charset: CFCharacterSet = CTFontCopyCharacterSet(CTFontCreateWithName(primary.id as CFString, 12, nil))
 
     init(id: String, faces: [Face], primary: Face) {
         self.id = id; self.faces = faces; self.primary = primary
+        self.category = Category.classify(family: id, ps: primary.id)
     }
 
     /// Faces matching any selected weight class and slant. Weight 0 ("Main") means the family's
@@ -122,7 +174,8 @@ enum Scanner {
             }
             guard !faces.isEmpty else { continue }
             faces.sort { ($0.face.weight, $0.face.italic ? 1 : 0, $0.trait) < ($1.face.weight, $1.face.italic ? 1 : 0, $1.trait) }
-            let main = faces.first { $0.face.weight == 4 && !$0.face.italic }
+            let main = faces.first { $0.face.style.lowercased() == "regular" }
+                ?? faces.first { $0.face.weight == 4 && !$0.face.italic }
                 ?? faces.filter { !$0.face.italic }.min { abs($0.trait) < abs($1.trait) }
                 ?? faces.min { abs($0.trait) < abs($1.trait) }!
             out.append(Family(id: name, faces: faces.map(\.face), primary: main.face))
@@ -183,7 +236,7 @@ struct RupaApp: App {
         if CommandLine.arguments.contains("--dump") {
             for f in Scanner.scan() {
                 for x in f.faces {
-                    print("\(f.id)\t\(x.style)\t\(Weight.names[x.weight])\(x.italic ? "\titalic" : "")\(x == f.primary ? "\tMAIN" : "")")
+                    print("\(f.id)\t\(f.category.name)\t\(x.style)\t\(Weight.names[x.weight])\(x.italic ? "\titalic" : "")\(x == f.primary ? "\tMAIN" : "")")
                 }
             }
             exit(0)
@@ -192,9 +245,9 @@ struct RupaApp: App {
 
     var body: some Scene {
         Window("rūpa", id: "main") {
-            ContentView(store: store).frame(minWidth: 820, minHeight: 480)
+            ContentView(store: store).frame(minWidth: 1000, minHeight: 480)
         }
-        .defaultSize(width: 1100, height: 820)
+        .defaultSize(width: 1200, height: 820)
     }
 }
 
@@ -206,9 +259,12 @@ struct ContentView: View {
     @AppStorage("weights") private var weightsRaw = "0"
     @AppStorage("upright") private var upright = true
     @AppStorage("italic") private var italic = false
+    @AppStorage("categories") private var categoriesRaw = ""   // empty = every category
+    @AppStorage("columns") private var columns = 1
     @State private var search = ""
 
     private var weights: Set<Int> { Set(weightsRaw.split(separator: ",").compactMap { Int($0) }) }
+    private var categories: Set<Int> { Set(categoriesRaw.split(separator: ",").compactMap { Int($0) }) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -224,11 +280,19 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 0) {
+                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0, alignment: .top), count: columns),
+                                  alignment: .leading, spacing: 0) {
                             ForEach(rows, id: \.0.id) { family, faces in
-                                FamilyHeader(store: store, family: family, sample: sample)
-                                ForEach(faces) { face in
-                                    FaceRow(face: face, sample: sample.isEmpty ? family.id : sample, size: size)
+                                VStack(alignment: .leading, spacing: 0) {
+                                    FamilyHeader(store: store, family: family, sample: sample)
+                                    ForEach(faces) { face in
+                                        FaceRow(face: face, sample: sample.isEmpty ? family.id : sample, size: size)
+                                    }
+                                }
+                                .padding(.bottom, 8)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                                .overlay(alignment: .trailing) {
+                                    if columns > 1 { Rectangle().fill(.separator).frame(width: 1) }
                                 }
                             }
                         }
@@ -243,9 +307,10 @@ struct ContentView: View {
     /// Families with at least one face matching the style chips, paired with those faces.
     private var visible: [(Family, [Face])] {
         let q = search.trimmingCharacters(in: .whitespaces)
-        let w = weights
+        let w = weights, c = categories
         return store.list(mode).compactMap { f in
-            guard q.isEmpty || f.id.localizedCaseInsensitiveContains(q) else { return nil }
+            guard q.isEmpty || f.id.localizedCaseInsensitiveContains(q),
+                  c.isEmpty || c.contains(f.category.rawValue) else { return nil }
             let faces = f.faces(weights: w, upright: upright, italic: italic)
             return faces.isEmpty ? nil : (f, faces)
         }
@@ -255,6 +320,12 @@ struct ContentView: View {
         var w = weights
         if w.contains(i) { if w.count > 1 { w.remove(i) } } else { w.insert(i) }
         weightsRaw = w.sorted().map(String.init).joined(separator: ",")
+    }
+
+    private func toggleCategory(_ c: Category) {
+        var s = categories
+        if s.contains(c.rawValue) { s.remove(c.rawValue) } else { s.insert(c.rawValue) }
+        categoriesRaw = s.sorted().map(String.init).joined(separator: ",")
     }
 
     private var header: some View {
@@ -275,10 +346,28 @@ struct ContentView: View {
                 .fixedSize()
                 TextField("Filter by name", text: $search)
                     .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 200)
+                    .frame(maxWidth: 180)
+                HStack(spacing: 6) {
+                    ForEach(Category.allCases) { c in
+                        Chip(label: c.name, on: categories.contains(c.rawValue)) { toggleCategory(c) }
+                            .help(c == .other ? "Script, display, symbol and non-Latin fonts" : "Only \(c.name.lowercased()) fonts")
+                    }
+                }
+                if !store.loading {
+                    Text("\(visible.count) shown").font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                }
                 Spacer()
+                Picker("", selection: $columns) {
+                    Image(systemName: "list.bullet").help("List").tag(1)
+                    Image(systemName: "square.grid.2x2").help("2 columns").tag(2)
+                    Image(systemName: "square.grid.3x2").help("3 columns").tag(3)
+                    Image(systemName: "square.grid.4x3.fill").help("4 columns").tag(4)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
                 Image(systemName: "textformat.size.smaller").foregroundStyle(.secondary)
-                Slider(value: $size, in: 10...160).frame(width: 180)
+                Slider(value: $size, in: 10...160).frame(width: 140)
                 Image(systemName: "textformat.size.larger").foregroundStyle(.secondary)
                 Text("\(Int(size))").monospacedDigit().foregroundStyle(.secondary).frame(width: 30, alignment: .trailing)
             }
@@ -330,7 +419,7 @@ struct FamilyHeader: View {
         let fav = store.favs.contains(family.id)
         let hidden = store.hidden.contains(family.id)
         HStack(spacing: 8) {
-            Text(family.id).font(.headline)
+            Text(family.id).font(.headline).lineLimit(1).truncationMode(.tail).help(family.id)
             Text("\(family.faces.count) style\(family.faces.count == 1 ? "" : "s")")
                 .font(.caption).foregroundStyle(.secondary)
             if !sample.isEmpty && !family.covers(sample) {
